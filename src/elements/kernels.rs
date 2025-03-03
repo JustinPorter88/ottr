@@ -631,8 +631,8 @@ pub fn calc_fd_d(fd_d: MatMut<f64>, fd_c: MatRef<f64>, e1_tilde: MatRef<f64>) {
 pub fn calc_fd_c_viscoelastic(
     fd_c: MatMut<f64>,
     h : f64,
-    kv_i: MatRef<f64>,
-    tau_i: f64,
+    kv_i: MatRef<f64>, // [6*6][nqps] at a constant time scale
+    tau_i: f64, // scalar for current time scale
     rr0: MatRef<f64>,
     strain_dot_n: MatRef<f64>,
     strain_dot_n1: MatRef<f64>,
@@ -643,16 +643,20 @@ pub fn calc_fd_c_viscoelastic(
 
     izip!(
         fd_c.col_iter_mut(),
+        kv_i.col_iter(),
         rr0.col_iter(),
         strain_dot_n.col_iter(),
         strain_dot_n1.col_iter(),
         visco_hist.col_iter(),
     )
     .for_each(|(fd_c,
+        ctau_star_curr,
         rr0_col,
         sd_n,
         sd_n1,
         visc_col)| {
+
+        let ctau_star_mat = ctau_star_curr.as_mat_ref(6, 6);
 
         let visco_curr = Scale(tmp.exp()) * visc_col
             + Scale(h/2. * tmp.exp()) * sd_n
@@ -663,7 +667,7 @@ pub fn calc_fd_c_viscoelastic(
         // force in sectional coordinates at quadrature
         matmul(
             fd_tmp.as_mut(),
-            kv_i,
+            ctau_star_mat,
             visco_curr,
             None,
             1.,

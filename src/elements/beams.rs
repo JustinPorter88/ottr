@@ -462,7 +462,7 @@ impl Beams {
                     self.qp.yd.subcols_mut(ei.i_qp_start, ei.n_qps),
                 );
             }
-            Damping::Viscoelastic(kv_i, tau_i) => {
+            Damping::Viscoelastic(ctau_star_i, tau_i) => {
 
                 rotate_col_to_sectional(
                     strain_dot_local.subcols_mut(ei.i_qp_start, ei.n_qps),
@@ -470,8 +470,10 @@ impl Beams {
                     self.qp.rr0.subcols(ei.i_qp_start, ei.n_qps)
                 );
 
+                println!("Shape ctau_star : {:?}", ctau_star_i.shape());
+
                 calculate_viscoelastic_force(
-                    kv_i.as_mat_ref(),
+                    ctau_star_i.subcols(ei.i_qp_start, ei.n_qps),
                     tau_i.as_col_ref(),
                     self.qp.rr0.subcols(ei.i_qp_start, ei.n_qps),
                     state.strain_dot_n.subcols(ei.i_qp_start, ei.n_qps),
@@ -1002,7 +1004,7 @@ pub fn calculate_mu_damping(
 
 
 pub fn calculate_viscoelastic_force(
-    kv_i: MatRef<f64>, //[36][n_prony]
+    ctau_star_all: MatRef<f64>, //[36*n_prony][n_qps in elem]
     tau_i: ColRef<f64>,
     rr0: MatRef<f64>,
     strain_dot_n: MatRef<f64>,
@@ -1036,16 +1038,26 @@ pub fn calculate_viscoelastic_force(
     xd.fill_zero();
     yd.fill_zero();
 
-    // copy kv_i needs to be reshaped to match formatting of mu_cuu
-    let mut flat_kvi: Mat<f64> = faer::Mat::zeros(36, mu_cuu.shape().1);
+    // Loop over time scales, lower level functions loop over qps in element
+    tau_i.iter().enumerate()
+    .for_each(|(index,tau_i_curr)| {
 
-    izip!(
-        kv_i.col_iter().enumerate(),
-        tau_i.iter()
-    )
-    .for_each(|((index,kvi_col), tau_i_curr)| {
+        // Reshape ctau_star_i to pull out matrices at the correct time scale for each
+        // quadrature point
+        let mut ctau_star_curr: Mat<f64> = faer::Mat::zeros(36, mu_cuu.shape().1);
 
-        let kvi_mat = kvi_col.as_mat_ref(6, 6);
+        for qp_ind in 0..mu_cuu.shape().1 {
+
+            // ctau_star at quadrature point and time scale
+            let ctau_qp_index = ctau_star_all
+                .col(qp_ind)
+                .as_mat_ref(36, tau_i.nrows())
+                .col(index);
+
+            let mut curr_col = ctau_star_curr.col_mut(qp_ind);
+
+            curr_col.copy_from(ctau_qp_index);
+        }
 
         let mut mu_cuu_tmp: Mat<f64> = faer::Mat::zeros(mu_cuu.shape().0, mu_cuu.shape().1);
         let mut fd_c_tmp: Mat<f64> = faer::Mat::zeros(fd_c.shape().0, fd_c.shape().1);
@@ -1057,11 +1069,10 @@ pub fn calculate_viscoelastic_force(
         let mut gd_tmp: Mat<f64> = faer::Mat::zeros(gd.shape().0, gd.shape().1);
         let mut xd_tmp: Mat<f64> = faer::Mat::zeros(xd.shape().0, xd.shape().1);
         let mut yd_tmp: Mat<f64> = faer::Mat::zeros(yd.shape().0, yd.shape().1);
-        let mut flat_kvi_tmp: Mat<f64> = faer::Mat::zeros(flat_kvi.shape().0, flat_kvi.shape().1);
 
         // Quadrature viscoelastic forces saved into fd_c
         calc_fd_c_viscoelastic(fd_c_tmp.as_mut(), h,
-                                kvi_mat,
+                                ctau_star_curr.as_ref(),
                                 *tau_i_curr,
                                 rr0,
                                 strain_dot_n,
@@ -1071,19 +1082,11 @@ pub fn calculate_viscoelastic_force(
         // Additional components similar to fd_d
         calc_fd_d(fd_d_tmp.as_mut(), fd_c_tmp.as_ref(), e1_tilde);
 
-
-        flat_kvi_tmp.col_iter_mut().for_each(
-            |col_kvi| {
-                let mut mat_kvi_grad = col_kvi.as_mat_mut(6,6);
-                mat_kvi_grad.copy_from((Scale(h/2.)*kvi_mat).as_mat_ref());
-            }
-        );
-
         // Gradient of global forces w.r.t. global strain rate at n+1
         // saved into mu_cuu
         calc_inertial_matrix(
             mu_cuu_tmp.as_mut(),
-            flat_kvi_tmp.as_mat_ref(),
+            (Scale(h/2.)*ctau_star_curr).as_mat_ref(),
             rr0
         );
 
@@ -1105,7 +1108,6 @@ pub fn calculate_viscoelastic_force(
         fd_c += fd_c_tmp;
         fd_d += fd_d_tmp;
 
-        flat_kvi += flat_kvi_tmp;
         mu_cuu += mu_cuu_tmp;
 
         sd += sd_tmp;
