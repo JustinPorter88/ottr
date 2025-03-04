@@ -470,8 +470,6 @@ impl Beams {
                     self.qp.rr0.subcols(ei.i_qp_start, ei.n_qps)
                 );
 
-                println!("Shape ctau_star : {:?}", ctau_star_i.shape());
-
                 calculate_viscoelastic_force(
                     ctau_star_i.subcols(ei.i_qp_start, ei.n_qps),
                     tau_i.as_col_ref(),

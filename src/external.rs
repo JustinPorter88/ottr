@@ -9,7 +9,7 @@ use crate::{
     interp::{gauss_legendre_lobotto_points, shape_deriv_matrix, shape_interp_matrix},
     model::Model,
     quadrature::Quadrature,
-    util::{quat_as_matrix, ColAsMatMut, Quat},
+    util::{quat_as_matrix, ColAsMatMut, Quat, ColAsMatRef},
 };
 
 pub fn add_beamdyn_blade(
@@ -17,13 +17,56 @@ pub fn add_beamdyn_blade(
     bd_primary_file_path: &str,
     bd_blade_file_path: &str,
     elem_order: usize,
-    damping: Damping,
+    mut damping: Damping,
+    viscoelastic_file_path: Option<&str>,
 ) -> (Vec<usize>, usize) {
     // Read key points
     let key_points = parse_beamdyn_primary_file(&fs::read_to_string(bd_primary_file_path).unwrap());
 
     // Read sections
-    let sections = parse_beamdyn_blade_file(&fs::read_to_string(bd_blade_file_path).unwrap());
+    let mut sections = parse_beamdyn_blade_file(&fs::read_to_string(bd_blade_file_path).unwrap());
+
+    let mut new_damping = Damping::None;
+    match viscoelastic_file_path {
+        Some(path) => {
+            let (nqp_visco, damping_tmp) = parse_beamdyn_viscoelastic_file(&fs::read_to_string(path).unwrap());
+            let mut c_star_visco = Mat::<f64>::zeros(36, nqp_visco);
+
+            if !(nqp_visco == sections.len()) {
+                panic!("Number of visoelastic stations does not match number of quadrature points.")
+            }
+
+            match damping_tmp {
+                Damping::Viscoelastic(ctau_star, tau_i) =>{
+                    let nrows = tau_i.nrows() - 1;
+                    let ctau_star_sub = ctau_star.subrows(0, 36*nrows).to_owned();
+                    let tau_i_sub = tau_i.subrows(0, nrows).to_owned();
+
+                    new_damping = Damping::Viscoelastic(ctau_star_sub, tau_i_sub);
+
+                    c_star_visco.copy_from(ctau_star.subrows(36*nrows, 36));
+                },
+                _ => ()
+            }
+
+            // Recreate sections but use c_star_visco for the c_star field.
+            let updated_sections = sections
+                .iter()
+                .enumerate()
+                .map(|(ind, s)|
+                    BeamSection {
+                        s : s.s,
+                        m_star: s.m_star.clone(),
+                        c_star: c_star_visco.col(ind).as_mat_ref(6, 6).clone().to_owned(),
+                    }
+                ).collect_vec();
+
+            damping = new_damping;
+            sections = updated_sections;
+
+        },
+        None => (),
+    }
 
     // Calculate key point position on range of [-1,1]
     let n_kps = key_points.len();

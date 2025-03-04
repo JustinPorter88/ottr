@@ -11,10 +11,10 @@ use faer::{
     unzipped, zipped, Col, ColRef, Mat, Scale,
 };
 
-use itertools::{izip, Itertools};
+use itertools::izip;
 use ottr::{
-    elements::beams::{Damping, BeamSection},
-    external::{add_beamdyn_blade, parse_beamdyn_viscoelastic_file},
+    elements::beams::Damping,
+    external::add_beamdyn_blade,
     model::Model,
     util::{quat_as_rotation_vector, ColAsMatRef, Quat},
     vtk::beams_qps_as_vtk,
@@ -24,7 +24,7 @@ fn main() {
 
     // Settings
     let inp_dir = "examples/inputs";
-    let _n_cycles = 3.5; // Number of oscillations to simulate
+    let n_cycles = 0.*3.5; // Number of oscillations to simulate
     let rho_inf = 1.; // Numerical damping
     let max_iter = 6; // Max convergence iterations
     let time_step = 0.01; // Time step
@@ -55,7 +55,7 @@ fn main() {
     let undamped = Damping::None;
 
     // Add BeamDyn blade to model
-    let (node_ids, _beam_elem_id) = add_beamdyn_blade(
+    let (node_ids_undamped, _beam_elem_id) = add_beamdyn_blade(
         &mut undamped_model,
         // &format!("{inp_dir}/bar-subcomponent_BeamDyn.dat"),
         // &format!("{inp_dir}/bar-subcomponent_BeamDyn_Blade.dat"),
@@ -63,6 +63,7 @@ fn main() {
         &format!("{inp_dir}/{blade_file}"),
         10,
         undamped,
+        None,
     );
 
     // Damped Model Creation
@@ -71,113 +72,41 @@ fn main() {
     model.set_max_iter(max_iter);
     model.set_time_step(time_step);
 
-    // Parse Viscoelastic Matrices
-    let full_viscoelastic = &format!("{inp_dir}/{viscoelastic_file}");
-    let (nqp_visco, damping_tmp) = parse_beamdyn_viscoelastic_file(
-        &fs::read_to_string(full_viscoelastic).unwrap());
+    let tmp_damping = Damping::None;
 
-    let mut damping = Damping::None;
-    let mut c_star_visco = Mat::<f64>::zeros(36, nqp_visco);
-
-    match damping_tmp {
-        Damping::Viscoelastic(ctau_star, tau_i) =>{
-            let nrows = tau_i.nrows() - 1;
-            let ctau_star_sub = ctau_star.subrows(0, 36*nrows).to_owned();
-            let tau_i_sub = tau_i.subrows(0, nrows).to_owned();
-
-            damping = Damping::Viscoelastic(ctau_star_sub, tau_i_sub);
-
-            c_star_visco.copy_from(ctau_star.subrows(36*nrows, 36));
-        },
-        _ => ()
-    }
-
-    if !(nqp_visco == undamped_model.beam_elements[0].quadrature.points.len()) {
-        panic!("Number of visoelastic stations does not match number of quadrature points.")
-    }
-
-    // Recreate sections but use c_star_visco for the c_star field.
-    let updated_sections = &undamped_model.beam_elements[0].sections
-        .iter()
-        .enumerate()
-        .map(|(ind, s)|
-            BeamSection {
-                s : s.s,
-                m_star: s.m_star.clone(),
-                c_star: c_star_visco.col(ind).as_mat_ref(6, 6).clone().to_owned(),
-            }
-        ).collect_vec();
-
-    // Add the beam element with updated sections
-    model.add_beam_element(&undamped_model.beam_elements[0].node_ids,
-        &undamped_model.beam_elements[0].quadrature,
-        &updated_sections,
-        damping);
+    let (node_ids, _beam_elem_id) = add_beamdyn_blade(
+        &mut model,
+        // &format!("{inp_dir}/bar-subcomponent_BeamDyn.dat"),
+        // &format!("{inp_dir}/bar-subcomponent_BeamDyn_Blade.dat"),
+        &format!("{inp_dir}/{bd_file}"),
+        &format!("{inp_dir}/{blade_file}"),
+        10,
+        tmp_damping,
+        Some(&format!("{inp_dir}/{viscoelastic_file}")),
+    );
 
     // Prescribed constraint to first node of beam
-    undamped_model.add_prescribed_constraint(node_ids[0]);
+    undamped_model.add_prescribed_constraint(node_ids_undamped[0]);
     model.add_prescribed_constraint(node_ids[0]);
 
     // Perform modal analysis
-    let (_eig_val, _eig_vec) = modal_analysis(&out_dir, &undamped_model);
+    let (eig_val, eig_vec) = modal_analysis(&out_dir, &undamped_model);
+    let (_eig_val, _eig_vec) = modal_analysis(&out_dir, &model);
 
-    println!("Eigvals - undamped: {:?}", _eig_val);
+    let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
 
-    println!("Need to add analysis of the viscoelastic model here.")
-    // let (_eig_val, _eig_vec) = modal_analysis(&out_dir, &model);
-    // println!("Eigvals - damped: {:?}", _eig_val);
+    println!("Frequency [Hz]: {:?}", Scale(1./2./PI) * &omega.subrows(0, 6));
 
-
-    // let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
-
-    // // Additional initialization for mu damping
-    // match damping {
-    //     Damping::Mu(_) => {
-    //         // Get index of maximum value
-    //         let i_max = eig_vec
-    //             .col_iter()
-    //             .map(|psi| {
-    //                 psi.iter()
-    //                     .enumerate()
-    //                     .max_by(|(_, &a), (_, &b)| a.abs().total_cmp(&b.abs()))
-    //                     .map(|(index, _)| index)
-    //                     .unwrap()
-    //                     % 3
-    //             })
-    //             .collect_vec();
-    //         let i_max_x = i_max.iter().position(|&i| i == 0).unwrap();
-    //         let i_max_y = i_max.iter().position(|&i| i == 1).unwrap();
-    //         let i_max_z = i_max.iter().position(|&i| i == 2).unwrap();
-
-    //         let mu_x = 2. * zeta[i_max_x] / omega[i_max_x];
-    //         let mu_y = 2. * zeta[i_max_y] / omega[i_max_y];
-    //         let mu_z = 2. * zeta[i_max_z] / omega[i_max_z];
-
-    //         let mu = col![mu_x, mu_y, mu_z, mu_x, mu_z, mu_y];
-    //         println!("mu={:?}", mu);
-    //         println!(
-    //             "modes: x={}, y={}, z={}",
-    //             i_max_x + 1,
-    //             i_max_y + 1,
-    //             i_max_z + 1
-    //         );
-    //         model
-    //             .beam_elements
-    //             .iter_mut()
-    //             .for_each(|e| e.damping = Damping::Mu(mu.clone()));
-    //     }
-    //     _ => (),
-    // }
-
-    // // Loop through modes and run simulation
-    // izip!(omega.iter(), eig_vec.col_iter())
-    //     .take(6)
-    //     .enumerate()
-    //     .for_each(|(i, (&omega, shape))| {
-    //         let t_end = 2. * PI / omega;
-    //         let n_steps = (n_cycles * t_end / time_step) as usize;
-    //         run_simulation(i + 1, time_step, n_steps, shape, out_dir, &model);
-    //     });
+    // Loop through modes and run simulation
+    izip!(omega.iter(), eig_vec.col_iter())
+        .take(2)
+        .enumerate()
+        .for_each(|(i, (&omega, shape))| {
+            let t_end = 2. * PI / omega;
+            let n_steps = (n_cycles * t_end / time_step) as usize;
+            run_simulation(i + 1, time_step, n_steps, shape, out_dir, &model);
+            // run_simulation(i + 1, time_step, n_steps, shape, out_dir, &undamped_model);
+        });
 }
 
 fn run_simulation(

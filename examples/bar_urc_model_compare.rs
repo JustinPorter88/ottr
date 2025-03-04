@@ -53,6 +53,7 @@ fn main() {
         &format!("{inp_dir}/bar_urc_bd_props.inp"),
         10,
         damping,
+        None,
     );
 
     // Prescribed constraint to first node of beam
