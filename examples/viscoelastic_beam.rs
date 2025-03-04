@@ -11,30 +11,23 @@ use faer::{
     unzipped, zipped, Col, ColRef, Mat, Scale,
 };
 
-use itertools::izip;
+use itertools::{izip, Itertools};
 use ottr::{
-    elements::beams::Damping,
-    external::add_beamdyn_blade,
+    elements::beams::{Damping, BeamSection},
+    external::{add_beamdyn_blade, parse_beamdyn_viscoelastic_file},
     model::Model,
     util::{quat_as_rotation_vector, ColAsMatRef, Quat},
     vtk::beams_qps_as_vtk,
 };
 
 fn main() {
-    // Damping ratio for modes 1-6
-    let zeta = col![0.01, 0.02, 0.03, 0.04, 0.05, 0.06];
-
-    // Select damping type
-    // let damping = Damping::None;
-    // let damping = Damping::Mu(col![0., 0., 0., 0., 0., 0.]);
-    let damping = Damping::ModalElement(zeta.clone());
 
     // Settings
     let inp_dir = "examples/inputs";
     let _n_cycles = 3.5; // Number of oscillations to simulate
     let rho_inf = 1.; // Numerical damping
     let max_iter = 6; // Max convergence iterations
-    let time_step = 0.0001; // Time step
+    let time_step = 0.01; // Time step
 
 
     // let out_dir = "output/bar_sub";
@@ -43,6 +36,7 @@ fn main() {
     let out_dir = "output/box_beam";
     let blade_file = "Box_Beam_BeamDyn_Blade.dat";
     let bd_file = "Box_Beam_BeamDyn.dat";
+    let viscoelastic_file = "Box_Beam_BeamDyn_Blade_Viscoelastic.dat";
 
     // // 13 Thermoplastic Blade
     // let out_dir = "output/tp13m";
@@ -52,28 +46,87 @@ fn main() {
     // Create output directory
     fs::create_dir_all(out_dir).unwrap();
 
-    // Create model and set solver parameters
-    let mut model = Model::new();
-    model.set_rho_inf(rho_inf);
-    model.set_max_iter(max_iter);
-    model.set_time_step(time_step);
+    // Create undamped model and set solver parameters
+    let mut undamped_model = Model::new();
+    undamped_model.set_rho_inf(rho_inf);
+    undamped_model.set_max_iter(max_iter);
+    undamped_model.set_time_step(time_step);
+
+    let undamped = Damping::None;
 
     // Add BeamDyn blade to model
     let (node_ids, _beam_elem_id) = add_beamdyn_blade(
-        &mut model,
+        &mut undamped_model,
         // &format!("{inp_dir}/bar-subcomponent_BeamDyn.dat"),
         // &format!("{inp_dir}/bar-subcomponent_BeamDyn_Blade.dat"),
         &format!("{inp_dir}/{bd_file}"),
         &format!("{inp_dir}/{blade_file}"),
         10,
-        damping,
+        undamped,
     );
 
+    // Damped Model Creation
+    let mut model = Model::new();
+    model.set_rho_inf(rho_inf);
+    model.set_max_iter(max_iter);
+    model.set_time_step(time_step);
+
+    // Parse Viscoelastic Matrices
+    let full_viscoelastic = &format!("{inp_dir}/{viscoelastic_file}");
+    let (nqp_visco, damping_tmp) = parse_beamdyn_viscoelastic_file(
+        &fs::read_to_string(full_viscoelastic).unwrap());
+
+    let mut damping = Damping::None;
+    let mut c_star_visco = Mat::<f64>::zeros(36, nqp_visco);
+
+    match damping_tmp {
+        Damping::Viscoelastic(ctau_star, tau_i) =>{
+            let nrows = tau_i.nrows() - 1;
+            let ctau_star_sub = ctau_star.subrows(0, 36*nrows).to_owned();
+            let tau_i_sub = tau_i.subrows(0, nrows).to_owned();
+
+            damping = Damping::Viscoelastic(ctau_star_sub, tau_i_sub);
+
+            c_star_visco.copy_from(ctau_star.subrows(36*nrows, 36));
+        },
+        _ => ()
+    }
+
+    if !(nqp_visco == undamped_model.beam_elements[0].quadrature.points.len()) {
+        panic!("Number of visoelastic stations does not match number of quadrature points.")
+    }
+
+    // Recreate sections but use c_star_visco for the c_star field.
+    let updated_sections = &undamped_model.beam_elements[0].sections
+        .iter()
+        .enumerate()
+        .map(|(ind, s)|
+            BeamSection {
+                s : s.s,
+                m_star: s.m_star.clone(),
+                c_star: c_star_visco.col(ind).as_mat_ref(6, 6).clone().to_owned(),
+            }
+        ).collect_vec();
+
+    // Add the beam element with updated sections
+    model.add_beam_element(&undamped_model.beam_elements[0].node_ids,
+        &undamped_model.beam_elements[0].quadrature,
+        &updated_sections,
+        damping);
+
     // Prescribed constraint to first node of beam
+    undamped_model.add_prescribed_constraint(node_ids[0]);
     model.add_prescribed_constraint(node_ids[0]);
 
     // Perform modal analysis
-    let (_eig_val, _eig_vec) = modal_analysis(&out_dir, &model);
+    let (_eig_val, _eig_vec) = modal_analysis(&out_dir, &undamped_model);
+
+    println!("Eigvals - undamped: {:?}", _eig_val);
+
+    println!("Need to add analysis of the viscoelastic model here.")
+    // let (_eig_val, _eig_vec) = modal_analysis(&out_dir, &model);
+    // println!("Eigvals - damped: {:?}", _eig_val);
+
 
     // let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
 

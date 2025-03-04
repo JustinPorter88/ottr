@@ -1,7 +1,7 @@
 use core::panic;
 use std::{f64::consts::PI, fs};
 
-use faer::{col, prelude::SpSolver, Mat};
+use faer::{col, prelude::SpSolver, Mat, Col};
 use itertools::{izip, Itertools};
 
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
     interp::{gauss_legendre_lobotto_points, shape_deriv_matrix, shape_interp_matrix},
     model::Model,
     quadrature::Quadrature,
-    util::{quat_as_matrix, Quat},
+    util::{quat_as_matrix, ColAsMatMut, Quat},
 };
 
 pub fn add_beamdyn_blade(
@@ -185,6 +185,107 @@ pub fn parse_beamdyn_blade_file(file_data: &str) -> Vec<BeamSection> {
             }
         })
         .collect_vec()
+}
+
+pub fn parse_beamdyn_viscoelastic_file(file_data: &str) -> (usize, Damping) {
+    let mut m = Mat::<f64>::zeros(3, 3);
+    let mut q_rot = col![0., 0., 0., 0.];
+    q_rot
+        .as_mut()
+        .quat_from_rotation_vector(col![0., -PI / 2., 0.].as_ref());
+    quat_as_matrix(q_rot.as_ref(), m.as_mut());
+    let mut m_rot = Mat::<f64>::zeros(6, 6);
+    m_rot.submatrix_mut(0, 0, 3, 3).copy_from(&m);
+    m_rot.submatrix_mut(3, 3, 3, 3).copy_from(&m);
+
+    let lines: Vec<&str> = file_data.lines().collect_vec();
+
+    // Get the number of stations
+    let stations_line = lines.get(3).unwrap();
+    if !stations_line.contains("station_total") {
+        panic!("line 4 doesn't contain stations_total.")
+    }
+    let n_stations: usize = stations_line
+        .split_whitespace()
+        .collect_vec()
+        .first()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Get number of time scales
+    let time_scales_line = lines.get(4).unwrap();
+    if !time_scales_line.contains("time_scales_total") {
+        panic!("line 5 doesn't contain kp_total")
+    }
+    let n_prony: usize = time_scales_line
+        .split_whitespace()
+        .collect_vec()
+        .first()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Get the time scales values
+    let time_list_line = lines.get(6).unwrap();
+
+    let tau_i_vec = time_list_line.split_ascii_whitespace()
+                                .filter_map(|s| s.parse::<f64>().ok())
+                                .collect_vec();
+
+
+    let tau_i = Col::<f64>::from_fn(n_prony, |i| tau_i_vec[i]);
+    let mut stations = Col::<f64>::zeros(n_stations);
+
+    // println!("Num tau_i: {:?}, tau values: {:?}", n_prony, tau_i_vec);
+    // println!("tau_i as col values: {:?}", tau_i);
+
+    let mut ctau_star_all = Mat::<f64>::zeros(6*6*n_prony,n_stations);
+
+    let lines = file_data.lines().skip(8).collect_vec();
+    izip!(
+        lines
+            .iter()
+            .chunks(1+7*n_prony)
+            .into_iter(),
+        ctau_star_all.col_iter_mut().enumerate(),
+    ).for_each(|(chunks, (station_ind, ctau_star_station))| {
+
+        let ls = chunks.collect_vec();
+
+        // section fraction of blade length
+        stations[station_ind] = ls[0].trim().parse::<f64>().unwrap();
+
+        let ctau_star_mat = ctau_star_station.as_mat_mut(36, n_prony);
+
+        // Inner loop of each time scale at this station
+        ctau_star_mat
+            .col_iter_mut()
+            .enumerate()
+            .for_each(|(time_ind, ctau_col)|
+        {
+            let c = (1+7*time_ind..7+7*time_ind)
+                            .map(|i| {
+                                ls[i]
+                                    .split_ascii_whitespace()
+                                    .filter_map(|s| s.parse::<f64>().ok())
+                                    .collect_vec()
+                            })
+                            .collect_vec();
+
+            // println!("c: {:?}", c);
+
+            let c_star = &m_rot * Mat::<f64>::from_fn(6, 6, |i, j| c[i][j]) * &m_rot.transpose();
+
+            let mut c_dest_mat = ctau_col.as_mat_mut(6, 6);
+            c_dest_mat.copy_from(c_star);
+        });
+
+    });
+
+    let damping = Damping::Viscoelastic(ctau_star_all, tau_i);
+
+    (n_stations, damping)
 }
 
 //------------------------------------------------------------------------------
