@@ -477,17 +477,28 @@ impl Solver {
 
         // Assemble system matrix
         let mut st_11 = self.st.submatrix_mut(0, 0, self.n_system, self.n_system);
-        zipped!(&mut st_11, &self.m, &self.ct).for_each(|unzipped!(st, m, ct)| {
-            *st = *m * self.p.beta_prime + *ct * self.p.gamma_prime
-        });
-        matmul(
-            st_11,
-            self.kt.as_ref(),
-            self.t.as_ref(),
-            Some(1.),
-            1.,
-            faer::Parallelism::None,
-        );
+        if self.p.is_static {
+            matmul(
+                st_11,
+                self.kt.as_ref(),
+                self.t.as_ref(),
+                None,
+                1.,
+                faer::Parallelism::None,
+            );
+        } else {
+            zipped!(&mut st_11, &self.m, &self.ct).for_each(|unzipped!(st, m, ct)| {
+                *st = *m * self.p.beta_prime + *ct * self.p.gamma_prime
+            });
+            matmul(
+                st_11,
+                self.kt.as_ref(),
+                self.t.as_ref(),
+                Some(1.),
+                1.,
+                faer::Parallelism::None,
+            );
+        }
 
         // Assemble constraints
         let st_21 = self
