@@ -9,7 +9,7 @@ pub struct State {
     pub n_nodes: usize,
     /// Initial global position/rotation `[7][n_nodes]`
     pub x0: Mat<f64>,
-    /// Current global position/rotation `[7][n_nodes]`
+    /// Current global position/rotation, x = x0 + u, `[7][n_nodes]`
     pub x: Mat<f64>,
     /// Displacement increment `[6][n_nodes]`
     pub u_delta: Mat<f64>,

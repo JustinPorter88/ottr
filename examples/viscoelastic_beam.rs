@@ -18,6 +18,8 @@ use ottr::{
     model::Model,
     util::{quat_as_rotation_vector, ColAsMatRef, Quat},
     vtk::beams_qps_as_vtk,
+    node::Direction,
+    state::State,
 };
 
 fn main() {
@@ -26,7 +28,7 @@ fn main() {
     let inp_dir = "examples/inputs";
     let n_cycles = 0.*3.5; // Number of oscillations to simulate
     let rho_inf = 1.; // Numerical damping
-    let max_iter = 6; // Max convergence iterations
+    let max_iter = 20; // Max convergence iterations
     let time_step = 0.01; // Time step
 
 
@@ -34,14 +36,16 @@ fn main() {
 
     // Box Beam Example from SONATA Repo
     let out_dir = "output/box_beam";
-    let blade_file = "Box_Beam_BeamDyn_Blade.dat";
     let bd_file = "Box_Beam_BeamDyn.dat";
+    let blade_file = "Box_Beam_BeamDyn_Blade.dat";
     let viscoelastic_file = "Box_Beam_BeamDyn_Blade_Viscoelastic.dat";
 
     // // 13 Thermoplastic Blade
     // let out_dir = "output/tp13m";
     // let blade_file = "Mass_BD_Blade.dat";
     // let bd_file = "IACMI_13m_thermoplastic_BeamDyn.dat";
+
+    // ----- Model Setup ----------------------------------
 
     // Create output directory
     fs::create_dir_all(out_dir).unwrap();
@@ -89,17 +93,98 @@ fn main() {
     undamped_model.add_prescribed_constraint(node_ids_undamped[0]);
     model.add_prescribed_constraint(node_ids[0]);
 
+    // ----- Static Analysis ----------------------------------
+
+    undamped_model.set_static_solve();
+
+    // static state and solvers
+    let mut static_state = undamped_model.create_state();
+    let mut solver = undamped_model.create_solver();
+
+    // // Point load:
+    // // Get DOF index for beam tip node X direction and apply load
+    // let tip_node_id = *node_ids.last().unwrap();
+    // let tip_x_dof = solver.nfm.get_dof(tip_node_id, Direction::X).unwrap();
+    // solver.fx[tip_x_dof] = 0.0e6; //1.0e6 gives a clear freq. shift.
+
+    // // Distributed load
+    // solver.elements.beams.qp.fx
+    //     .subrows_mut(0, 1)
+    //     .col_iter_mut()
+    //     .for_each(|mut fx| fx[0] = 1.0e4); //1e8 is good when have sufficient integration.
+
+    // Variable Distributed load
+    let rot_rad_s = 6.0; // rad/s
+    izip!(
+        solver.elements.beams.qp.fx.subrows_mut(0, 1).col_iter_mut(),
+        solver.elements.beams.qp.x0.subrows(0, 1).col_iter(),
+        solver.elements.beams.qp.m_star.col_iter(),
+    )
+    .for_each(|(mut fx, radius, m_star_col)| {
+        // Need to extract the quadrature point mass here.
+        fx[0] = m_star_col[0]*radius[0] * rot_rad_s * rot_rad_s;
+    });
+
+    // println!("Mass[0,0] {:?}", solver.elements.beams.qp.m_star.col(0).subrows(0, 1));
+    // println!("x0: {:?}", solver.elements.beams.qp.x0);
+    println!("qp.fx (main): {:?}", solver.elements.beams.qp.fx);
+
+    // Get static solution
+    let _res = solver.step(&mut static_state);
+
+    // Print displacements for reference
+    let n_nodes = undamped_model.nodes.len();
+    let s_nodes = Col::<f64>::from_fn(n_nodes, |i| undamped_model.nodes[i].s);
+
+    println!("Static u_x: {:?}", static_state.u.row(0));
+    // println!("Static x_x: {:?}", static_state.x.row(0)); // x = x_0 + u
+    println!("Node positions on [0, 1]: {:?}", s_nodes);
+
+    // ----- Eigen Analysis ----------------------------------
+
+    model.set_dynamic_solve();
+
     // Perform modal analysis
-    let (eig_val, eig_vec) = modal_analysis(&out_dir, &undamped_model);
-    let (_eig_val, _eig_vec) = modal_analysis(&out_dir, &model);
+
+    println!("Baseline Modal Analysis:");
+    let mut base_state = undamped_model.create_state();
+
+    let (eig_val, _eig_vec, mass, stiff) = modal_analysis(&out_dir, &undamped_model, base_state);
 
     let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
 
     println!("Frequency [Hz]: {:?}", Scale(1./2./PI) * &omega.subrows(0, 6));
 
+    println!("Prestressed Modal Analysis:");
+
+    let (eig_val, eig_vec, mass_pre, stiff_pre) = modal_analysis(&out_dir, &undamped_model, static_state);
+
+    let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
+
+    println!("Frequency [Hz]: {:?}", Scale(1./2./PI) * &omega.subrows(0, 6));
+
+    let mass_diff = mass_pre.clone() - mass.clone();
+    let stiff_diff = stiff_pre.clone() - stiff.clone();
+    let stiff_sym = stiff_pre.clone() - stiff_pre.transpose();
+
+    println!(
+        "Norm ratio Mass (diff/analytical): {:?}",
+        mass_diff.norm_l2() / mass_pre.norm_l2()
+    );
+    println!(
+        "Norm ratio Stiffness (diff/analytical): {:?}",
+        stiff_diff.norm_l2() / stiff_pre.norm_l2()
+    );
+    println!(
+        "Norm ratio Stiffness Symmetry (diff/analytical): {:?}",
+        stiff_sym.norm_l2() / stiff_pre.norm_l2()
+    );
+
+    // ----- Transient Time Integration ----------------------------------
+
     // Loop through modes and run simulation
     izip!(omega.iter(), eig_vec.col_iter())
-        .take(2)
+        .take(4)
         .enumerate()
         .for_each(|(i, (&omega, shape))| {
             let t_end = 2. * PI / omega;
@@ -160,10 +245,9 @@ fn run_simulation(
     }
 }
 
-fn modal_analysis(out_dir: &str, model: &Model) -> (Col<f64>, Mat<f64>) {
+fn modal_analysis(out_dir: &str, model: &Model, mut state: State) -> (Col<f64>, Mat<f64>, Mat<f64>, Mat<f64>) {
     // Create solver and state from model
     let mut solver = model.create_solver();
-    let mut state = model.create_state();
 
     // should not matter in modal analysis, argument needed for viscoelastic
     let h = 0.0;
@@ -180,6 +264,10 @@ fn modal_analysis(out_dir: &str, model: &Model) -> (Col<f64>, Mat<f64>) {
         solver.r.as_mut(),
     );
 
+    let mass: Mat<f64> = solver.m.clone().to_owned();
+    let stiff = solver.kt.clone().to_owned();
+
+    println!("This needs to be updated for free-free");
     let ndof_bc = solver.n_system - 6;
     let lu = solver.m.submatrix(6, 6, ndof_bc, ndof_bc).partial_piv_lu();
     let a = lu.solve(solver.kt.submatrix(6, 6, ndof_bc, ndof_bc));
@@ -285,5 +373,5 @@ fn modal_analysis(out_dir: &str, model: &Model) -> (Col<f64>, Mat<f64>) {
         },
     );
 
-    (eig_val, eig_vec)
+    (eig_val, eig_vec, mass, stiff)
 }
