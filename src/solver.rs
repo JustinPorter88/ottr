@@ -374,8 +374,9 @@ impl Solver {
         //------------------------------------------------------------------
 
         // May need to calculate the displacements before proceeding with strain calculation.
-        println!("TODO: Not sure if this is needed here. If needed, add to solver.step as well.");
-        state.calc_displacement(self.p.h);
+        println!("TODO: Not sure if need state.calc_displacement here. If needed, add to solver.step as well.");
+        // Adding this line appears to overwrite the state in the static case.
+        // state.calc_displacement(self.p.h);
 
         // Update strain_dot from previous step before
         // predicting (which overrides velocities)
@@ -411,12 +412,19 @@ impl Solver {
                 };
             });
 
-        state.update_dynamic_prediction(
-            self.p.h,
-            self.p.beta_prime,
-            self.p.gamma_prime,
-            self.x_delta.as_ref(),
-        );
+        // Update state prediction
+        if self.p.is_static {
+            state.update_static_prediction(
+                self.p.h,
+                self.x_delta.as_ref());
+        } else {
+            state.update_dynamic_prediction(
+                self.p.h,
+                self.p.beta_prime,
+                self.p.gamma_prime,
+                self.x_delta.as_ref(),
+            );
+        }
 
         // Initialize lambda to zero
         self.lambda.fill_zero();
