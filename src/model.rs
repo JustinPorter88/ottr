@@ -11,6 +11,7 @@ use crate::quadrature::Quadrature;
 use crate::solver::{Solver, StepParameters};
 use crate::state::State;
 
+#[derive(Clone)]
 pub struct Model {
     gravity: [f64; 3],
     h: f64,
@@ -24,6 +25,7 @@ pub struct Model {
     pub mass_elements: Vec<MassElement>,
     pub spring_elements: Vec<SpringElement>,
     constraints: Vec<ConstraintInput>,
+    distributed_loads: Option<Mat<f64>>,
 }
 
 impl Model {
@@ -42,6 +44,7 @@ impl Model {
             mass_elements: vec![],
             spring_elements: vec![],
             constraints: vec![],
+            distributed_loads : None,
         }
     }
 
@@ -76,6 +79,10 @@ impl Model {
         self.is_static = true;
     }
 
+    pub fn set_distributed_loads(&mut self, fx: Mat<f64>) {
+        self.distributed_loads = Some(fx);
+    }
+
     /// Create solver
     pub fn create_solver(&self) -> Solver {
         let nfm = self.create_node_freedom_map();
@@ -89,7 +96,14 @@ impl Model {
             self.max_iter,
             self.is_static,
         );
-        Solver::new(step_parameters, nfm, elements, constraints)
+        let mut solver = Solver::new(step_parameters, nfm, elements, constraints);
+        match &self.distributed_loads {
+            Some(fx) => {
+                solver.elements.beams.qp.fx.copy_from(fx);
+            },
+            None => ()
+        }
+        solver
     }
 
     /// Create elements

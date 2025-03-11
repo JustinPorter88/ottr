@@ -19,6 +19,7 @@ use super::kernels::{calc_fd_c, calc_fd_d, calc_inertial_matrix,
     calc_sd_pd_od_qd_gd_xd_yd, calc_fd_c_viscoelastic,
     rotate_col_to_sectional,update_viscoelastic,};
 
+#[derive(Clone)]
 pub struct BeamElement {
     pub id: usize,
     pub node_ids: Vec<usize>,

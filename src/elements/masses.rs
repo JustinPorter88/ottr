@@ -14,6 +14,7 @@ use super::kernels::{
     calc_fg, calc_fi, calc_gi, calc_inertial_matrix, calc_ki, calc_m_eta_rho, calc_rr0, calc_x,
 };
 
+#[derive(Clone)]
 pub struct MassElement {
     pub id: usize,
     pub node_id: usize,

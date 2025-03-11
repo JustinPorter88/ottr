@@ -26,7 +26,7 @@ fn main() {
 
     // Settings
     let inp_dir = "examples/inputs";
-    let n_cycles = 0.*3.5; // Number of oscillations to simulate
+    let n_cycles = 3.5; // Number of oscillations to simulate
     let rho_inf = 1.; // Numerical damping
     let max_iter = 20; // Max convergence iterations
     let time_step = 0.01; // Time step
@@ -97,6 +97,34 @@ fn main() {
 
     undamped_model.set_static_solve();
 
+    // create a solver so can access data on solver, but will
+    // eventually recreate with the distrubted load.
+    let mut solver = undamped_model.create_solver();
+
+    // // Distributed load
+    // solver.elements.beams.qp.fx
+    //     .subrows_mut(0, 1)
+    //     .col_iter_mut()
+    //     .for_each(|mut fx| fx[0] = 1.0e4); //1e8 is good when have sufficient integration.
+
+    // Variable Distributed load
+    let n_qps = solver.elements.beams.qp.fx.ncols();
+    let mut fx = Mat::<f64>::zeros(6, n_qps);
+
+    let rot_rad_s = 6.0; // rad/s
+    izip!(
+        fx.subrows_mut(0, 1).col_iter_mut(),
+        solver.elements.beams.qp.x0.subrows(0, 1).col_iter(),
+        solver.elements.beams.qp.m_star.col_iter(),
+    )
+    .for_each(|(mut fx_col, radius, m_star_col)| {
+        // Need to extract the quadrature point mass here.
+        fx_col[0] = m_star_col[0]*radius[0] * rot_rad_s * rot_rad_s;
+    });
+
+    undamped_model.set_distributed_loads(fx.clone());
+    model.set_distributed_loads(fx.clone());
+
     // static state and solvers
     let mut static_state = undamped_model.create_state();
     let mut solver = undamped_model.create_solver();
@@ -106,24 +134,6 @@ fn main() {
     // let tip_node_id = *node_ids.last().unwrap();
     // let tip_x_dof = solver.nfm.get_dof(tip_node_id, Direction::X).unwrap();
     // solver.fx[tip_x_dof] = 0.0e6; //1.0e6 gives a clear freq. shift.
-
-    // // Distributed load
-    // solver.elements.beams.qp.fx
-    //     .subrows_mut(0, 1)
-    //     .col_iter_mut()
-    //     .for_each(|mut fx| fx[0] = 1.0e4); //1e8 is good when have sufficient integration.
-
-    // Variable Distributed load
-    let rot_rad_s = 6.0; // rad/s
-    izip!(
-        solver.elements.beams.qp.fx.subrows_mut(0, 1).col_iter_mut(),
-        solver.elements.beams.qp.x0.subrows(0, 1).col_iter(),
-        solver.elements.beams.qp.m_star.col_iter(),
-    )
-    .for_each(|(mut fx, radius, m_star_col)| {
-        // Need to extract the quadrature point mass here.
-        fx[0] = m_star_col[0]*radius[0] * rot_rad_s * rot_rad_s;
-    });
 
     // println!("Mass[0,0] {:?}", solver.elements.beams.qp.m_star.col(0).subrows(0, 1));
     // println!("x0: {:?}", solver.elements.beams.qp.x0);
@@ -149,7 +159,7 @@ fn main() {
     println!("Baseline Modal Analysis:");
     let mut base_state = undamped_model.create_state();
 
-    let (eig_val, _eig_vec, mass, stiff) = modal_analysis(&out_dir, &undamped_model, base_state);
+    let (eig_val, _eig_vec) = modal_analysis(&out_dir, &undamped_model, base_state);
 
     let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
 
@@ -157,28 +167,11 @@ fn main() {
 
     println!("Prestressed Modal Analysis:");
 
-    let (eig_val, eig_vec, mass_pre, stiff_pre) = modal_analysis(&out_dir, &undamped_model, static_state);
+    let (eig_val, eig_vec) = modal_analysis(&out_dir, &undamped_model, static_state.clone());
 
     let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
 
     println!("Frequency [Hz]: {:?}", Scale(1./2./PI) * &omega.subrows(0, 6));
-
-    let mass_diff = mass_pre.clone() - mass.clone();
-    let stiff_diff = stiff_pre.clone() - stiff.clone();
-    let stiff_sym = stiff_pre.clone() - stiff_pre.transpose();
-
-    println!(
-        "Norm ratio Mass (diff/analytical): {:?}",
-        mass_diff.norm_l2() / mass_pre.norm_l2()
-    );
-    println!(
-        "Norm ratio Stiffness (diff/analytical): {:?}",
-        stiff_diff.norm_l2() / stiff_pre.norm_l2()
-    );
-    println!(
-        "Norm ratio Stiffness Symmetry (diff/analytical): {:?}",
-        stiff_sym.norm_l2() / stiff_pre.norm_l2()
-    );
 
     // ----- Transient Time Integration ----------------------------------
 
@@ -188,9 +181,14 @@ fn main() {
         .enumerate()
         .for_each(|(i, (&omega, shape))| {
             let t_end = 2. * PI / omega;
+            let time_step = t_end / 100.;
             let n_steps = (n_cycles * t_end / time_step) as usize;
-            run_simulation(i + 1, time_step, n_steps, shape, out_dir, &model);
-            // run_simulation(i + 1, time_step, n_steps, shape, out_dir, &undamped_model);
+
+            let mut curr_model = model.clone();
+            curr_model.set_time_step(time_step);
+
+            // run_simulation(i + 1, time_step, n_steps, shape, out_dir, model.clone());
+            run_simulation(i + 1, time_step, n_steps, shape, out_dir, curr_model);
         });
 }
 
@@ -200,11 +198,20 @@ fn run_simulation(
     n_steps: usize,
     shape: ColRef<f64>,
     out_dir: &str,
-    model: &Model,
+    mut model: Model,
 ) {
     // Create new solver where beam elements have damping
+    model.set_static_solve();
     let mut solver = model.create_solver();
-    let mut state = model.create_state();
+    let mut static_state = model.create_state();
+
+    // Do static solve for inital displacements
+    solver.step(&mut static_state);
+
+    // Dynamic states/solver
+    model.set_dynamic_solve();
+    let mut solver = model.create_solver();
+    let mut state = static_state.clone();
 
     // Apply scaled mode shape to state as velocity
     let v = shape;
@@ -245,7 +252,7 @@ fn run_simulation(
     }
 }
 
-fn modal_analysis(out_dir: &str, model: &Model, mut state: State) -> (Col<f64>, Mat<f64>, Mat<f64>, Mat<f64>) {
+fn modal_analysis(out_dir: &str, model: &Model, mut state: State) -> (Col<f64>, Mat<f64>) {
     // Create solver and state from model
     let mut solver = model.create_solver();
 
@@ -373,5 +380,5 @@ fn modal_analysis(out_dir: &str, model: &Model, mut state: State) -> (Col<f64>, 
         },
     );
 
-    (eig_val, eig_vec, mass, stiff)
+    (eig_val, eig_vec)
 }

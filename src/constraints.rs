@@ -18,6 +18,7 @@ pub enum ConstraintKind {
     Prescribed,
 }
 
+#[derive(Clone)]
 pub struct ConstraintInput {
     pub id: usize,
     pub kind: ConstraintKind,

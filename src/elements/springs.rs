@@ -11,6 +11,7 @@ use crate::{
 };
 
 /// Spring element definition
+#[derive(Clone)]
 pub struct SpringElement {
     pub id: usize,
     pub undeformed_length: Option<f64>,

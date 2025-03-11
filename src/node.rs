@@ -1,5 +1,6 @@
 use itertools::Itertools;
 
+#[derive(Clone)]
 pub struct Node {
     /// Node identifier
     pub id: usize,
