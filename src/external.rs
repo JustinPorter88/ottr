@@ -19,6 +19,7 @@ pub fn add_beamdyn_blade(
     elem_order: usize,
     mut damping: Damping,
     viscoelastic_file_path: Option<&str>,
+    num_guass_quad : Option<usize>,
 ) -> (Vec<usize>, usize) {
     // Read key points
     let key_points = parse_beamdyn_primary_file(&fs::read_to_string(bd_primary_file_path).unwrap());
@@ -132,7 +133,13 @@ pub fn add_beamdyn_blade(
         .collect_vec();
 
     // Quadrature rule
-    let gq = Quadrature::trapezoidal(&sections.iter().map(|s| s.s).collect_vec());
+    let mut gq = Quadrature::trapezoidal(&sections.iter().map(|s| s.s).collect_vec());
+    match num_guass_quad {
+        Some(nqp) =>{
+            gq = Quadrature::gauss(nqp);
+        },
+        None => (),
+    }
 
     // Add beam element
     let beam_elem_id = model.add_beam_element(&node_ids, &gq, &sections, damping);

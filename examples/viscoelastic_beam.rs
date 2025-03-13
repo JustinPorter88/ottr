@@ -8,10 +8,10 @@ use faer::{
     col,
     prelude::{c64, SpSolver},
     sparse::solvers::Eigendecomposition,
-    unzipped, zipped, Col, ColRef, Mat, Scale,
+    unzipped, zipped, Col, ColRef, Mat, MatRef, Scale
 };
 
-use itertools::izip;
+use itertools::{izip, Itertools};
 use ottr::{
     elements::beams::Damping,
     external::add_beamdyn_blade,
@@ -20,6 +20,7 @@ use ottr::{
     vtk::beams_qps_as_vtk,
     node::Direction,
     state::State,
+    elements::kernels::rotate_col_to_sectional
 };
 
 fn main() {
@@ -30,14 +31,17 @@ fn main() {
     let rho_inf = 1.; // Numerical damping
     let max_iter = 20; // Max convergence iterations
     let time_step = 0.01; // Time step
+    let nqp = None; //Some(12); // Number of guass quad points to use. None-> trapezoid rule
 
+    let tip_amp = 0.1;
 
     // let out_dir = "output/bar_sub";
 
     // Box Beam Example from SONATA Repo
     let out_dir = "output/box_beam";
     let bd_file = "Box_Beam_BeamDyn.dat";
-    let blade_file = "Box_Beam_BeamDyn_Blade.dat";
+    // let blade_file = "Box_Beam_BeamDyn_Blade.dat";
+    let blade_file = "Box_Beam_BeamDyn_Blade_Clean.dat";
     let viscoelastic_file = "Box_Beam_BeamDyn_Blade_Viscoelastic.dat";
 
     // // 13 Thermoplastic Blade
@@ -68,6 +72,7 @@ fn main() {
         10,
         undamped,
         None,
+        nqp,
     );
 
     // Damped Model Creation
@@ -87,6 +92,7 @@ fn main() {
         10,
         tmp_damping,
         Some(&format!("{inp_dir}/{viscoelastic_file}")),
+        nqp,
     );
 
     // Prescribed constraint to first node of beam
@@ -121,22 +127,25 @@ fn main() {
         // Need to extract the quadrature point mass here.
         fx_col[0] = m_star_col[0]*radius[0] * rot_rad_s * rot_rad_s;
     });
-
-    undamped_model.set_distributed_loads(fx.clone());
-    model.set_distributed_loads(fx.clone());
+    match nqp {
+        Some(_) => println!("Cannot use this as distributed loads if have non-constant cross section!"),
+        None => (),
+    }
+    // undamped_model.set_distributed_loads(fx.clone());
+    // model.set_distributed_loads(fx.clone());
 
     // static state and solvers
     let mut static_state = undamped_model.create_state();
     let mut solver = undamped_model.create_solver();
 
-    // // Point load:
-    // // Get DOF index for beam tip node X direction and apply load
-    // let tip_node_id = *node_ids.last().unwrap();
-    // let tip_x_dof = solver.nfm.get_dof(tip_node_id, Direction::X).unwrap();
-    // solver.fx[tip_x_dof] = 0.0e6; //1.0e6 gives a clear freq. shift.
+    // Point load:
+    // Get DOF index for beam tip node X direction and apply load
+    let tip_node_id = *node_ids.last().unwrap();
+    let tip_x_dof = solver.nfm.get_dof(tip_node_id, Direction::X).unwrap();
+    solver.fx[tip_x_dof] = 1.0e6; //1.0e6 gives a clear freq. shift.
 
     // println!("Mass[0,0] {:?}", solver.elements.beams.qp.m_star.col(0).subrows(0, 1));
-    // println!("x0: {:?}", solver.elements.beams.qp.x0);
+    println!("x0: {:?}", solver.elements.beams.qp.x0);
     println!("qp.fx (main): {:?}", solver.elements.beams.qp.fx);
 
     // Get static solution
@@ -172,6 +181,19 @@ fn main() {
     let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
 
     println!("Frequency [Hz]: {:?}", Scale(1./2./PI) * &omega.subrows(0, 6));
+
+    // ----- Static Analysis of Internal Modal Forces ---------------------
+    // Only consider the undamped_model for this analysis
+
+    // Apply only the eig_vec as a set of displacements
+    internal_forces(
+        &undamped_model,
+        &(static_state.clone()),
+        eig_vec.col(0).clone(),
+        out_dir,
+        0,
+        tip_amp,
+    );
 
     // ----- Transient Time Integration ----------------------------------
 
@@ -250,6 +272,158 @@ fn run_simulation(
 
         assert_eq!(res.converged, true);
     }
+}
+
+fn write_fc_star(
+    mut file: File,
+    stations : &Vec<f64>,
+    weights : &Vec<f64>,
+    f_c: MatRef<f64>
+    ){
+    write!(
+        file,
+        "station,weight,Fx,Fy,Fz,Mx,My,Mz (OpenTurbine Coordinates) \n",
+    ).unwrap();
+
+    izip!(stations.iter(), weights.iter(), f_c.col_iter())
+        .for_each(|(stat, w, f_c_col)|
+    {
+        write!(
+            file,
+            "{},{},{},{},{},{},{},{}\n",
+            stat,w,f_c_col[0], f_c_col[1], f_c_col[2], f_c_col[3], f_c_col[4], f_c_col[5]
+        ).unwrap();
+    });
+}
+
+fn internal_forces(
+    model: &Model,
+    static_state: &State,
+    eigen_shape: ColRef<f64>,
+    out_dir: &str,
+    mode: usize,
+    tip_amp : f64) {
+    // Only consider the undamped_model for this analysis
+
+
+    // Apply only the static displacements
+    let mut solver_undamped = model.create_solver();
+
+    solver_undamped.elements.assemble_system(
+        static_state,
+        &solver_undamped.nfm,
+        solver_undamped.p.h,
+        solver_undamped.m.as_mut(),
+        solver_undamped.ct.as_mut(),
+        solver_undamped.kt.as_mut(),
+        solver_undamped.r.as_mut(),
+    );
+
+    let nqp = solver_undamped.elements.beams.qp.fe_c.shape().1;
+    let mut fe_c_star = Mat::<f64>::zeros(6, nqp);
+
+    rotate_col_to_sectional(
+        fe_c_star.as_mut(),
+        solver_undamped.elements.beams.qp.fe_c.as_ref(),
+        solver_undamped.elements.beams.qp.rr0.as_ref()
+    );
+
+    println!("fe_c_star (static) : {:?}", fe_c_star);
+
+    // let section_loc = model.beam_elements[0].sections.iter().map(|s| s.s).collect_vec();
+    let section_loc = model.beam_elements[0].quadrature.points.iter().map(|&s| (s+1.)/2.).collect_vec();
+    let section_weights = model.beam_elements[0].quadrature.weights.iter().map(|&w| w).collect_vec();
+
+
+    write_fc_star(
+        File::create(format!("{out_dir}/fc_star_prestress_{:02}.csv", mode)).unwrap(),
+        &section_loc,
+        &section_weights,
+        fe_c_star.as_ref()
+    );
+
+
+    // Apply only the eig_vec as a set of displacements
+    let mut eig_state = model.create_state();
+    let h = 1.;
+    let u = eigen_shape * Scale(tip_amp);
+
+    eig_state.u_prev.fill_zero();
+    eig_state.u_prev.row_mut(3).fill(1.);
+    eig_state.u_delta.copy_from(&u.as_ref().as_mat_ref(6, eig_state.n_nodes));
+    eig_state.calc_displacement(h);
+    eig_state.calculate_x();
+
+    println!("Eigen state.u {:?}", eig_state.u);
+
+    solver_undamped.elements.assemble_system(
+        &eig_state,
+        &solver_undamped.nfm,
+        solver_undamped.p.h,
+        solver_undamped.m.as_mut(),
+        solver_undamped.ct.as_mut(),
+        solver_undamped.kt.as_mut(),
+        solver_undamped.r.as_mut(),
+    );
+
+    let mut fe_c_star = Mat::<f64>::zeros(6, nqp);
+
+    rotate_col_to_sectional(
+        fe_c_star.as_mut(),
+        solver_undamped.elements.beams.qp.fe_c.as_ref(),
+        solver_undamped.elements.beams.qp.rr0.as_ref()
+    );
+
+
+    write_fc_star(
+        File::create(format!("{out_dir}/fc_star_eigen_{:02}.csv", mode)).unwrap(),
+        &section_loc,
+        &section_weights,
+        fe_c_star.as_ref()
+    );
+
+
+    // Apply both combined - need to verify how to do this.
+
+
+    // Apply only the eig_vec as a set of displacements
+    let mut eig_pre_state = static_state.clone();
+    let h = 1.;
+    let u = eigen_shape * Scale(tip_amp);
+
+    eig_pre_state.u_prev.copy_from(eig_pre_state.u.clone());
+    eig_pre_state.u_delta.copy_from(&u.as_ref().as_mat_ref(6, eig_state.n_nodes));
+    eig_pre_state.calc_displacement(h);
+    eig_pre_state.calculate_x();
+
+    println!("Pre + Eigen state.u {:?}", eig_state.u);
+
+    solver_undamped.elements.assemble_system(
+        &eig_pre_state,
+        &solver_undamped.nfm,
+        solver_undamped.p.h,
+        solver_undamped.m.as_mut(),
+        solver_undamped.ct.as_mut(),
+        solver_undamped.kt.as_mut(),
+        solver_undamped.r.as_mut(),
+    );
+
+    let mut fe_c_star = Mat::<f64>::zeros(6, nqp);
+
+    rotate_col_to_sectional(
+        fe_c_star.as_mut(),
+        solver_undamped.elements.beams.qp.fe_c.as_ref(),
+        solver_undamped.elements.beams.qp.rr0.as_ref()
+    );
+
+
+    write_fc_star(
+        File::create(format!("{out_dir}/fc_star_pre_and_eigen_{:02}.csv", mode)).unwrap(),
+        &section_loc,
+        &section_weights,
+        fe_c_star.as_ref()
+    );
+
 }
 
 fn modal_analysis(out_dir: &str, model: &Model, mut state: State) -> (Col<f64>, Mat<f64>) {

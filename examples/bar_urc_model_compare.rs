@@ -54,6 +54,7 @@ fn main() {
         10,
         damping,
         None,
+        None,
     );
 
     // Prescribed constraint to first node of beam
