@@ -31,17 +31,18 @@ fn main() {
     let rho_inf = 1.; // Numerical damping
     let max_iter = 20; // Max convergence iterations
     let time_step = 0.01; // Time step
-    let nqp = None; //Some(12); // Number of guass quad points to use. None-> trapezoid rule
+    let nqp = Some(12); // Number of guass quad points to use. None-> trapezoid rule
 
-    let tip_amp = 0.1;
+    // see clear axial quadratic forces, so keep amplitudes small
+    let tip_amp = 0.00007850090768953785;
 
     // let out_dir = "output/bar_sub";
 
     // Box Beam Example from SONATA Repo
     let out_dir = "output/box_beam";
     let bd_file = "Box_Beam_BeamDyn.dat";
-    // let blade_file = "Box_Beam_BeamDyn_Blade.dat";
-    let blade_file = "Box_Beam_BeamDyn_Blade_Clean.dat";
+    let blade_file = "Box_Beam_BeamDyn_Blade.dat";
+    // let blade_file = "Box_Beam_BeamDyn_Blade_Clean.dat";
     let viscoelastic_file = "Box_Beam_BeamDyn_Blade_Viscoelastic.dat";
 
     // // 13 Thermoplastic Blade
@@ -119,7 +120,7 @@ fn main() {
 
     let rot_rad_s = 6.0; // rad/s
     izip!(
-        fx.subrows_mut(0, 1).col_iter_mut(),
+        fx.subrows_mut(0, 1).col_iter_mut(), //xdof is row 0
         solver.elements.beams.qp.x0.subrows(0, 1).col_iter(),
         solver.elements.beams.qp.m_star.col_iter(),
     )
@@ -131,6 +132,7 @@ fn main() {
         Some(_) => println!("Cannot use this as distributed loads if have non-constant cross section!"),
         None => (),
     }
+    // // Next two lines to actually set distribued loads
     // undamped_model.set_distributed_loads(fx.clone());
     // model.set_distributed_loads(fx.clone());
 
@@ -142,11 +144,11 @@ fn main() {
     // Get DOF index for beam tip node X direction and apply load
     let tip_node_id = *node_ids.last().unwrap();
     let tip_x_dof = solver.nfm.get_dof(tip_node_id, Direction::X).unwrap();
-    solver.fx[tip_x_dof] = 1.0e6; //1.0e6 gives a clear freq. shift.
+    solver.fx[tip_x_dof] = 0.0e3; //1.0e6 gives a clear freq. shift.
 
     // println!("Mass[0,0] {:?}", solver.elements.beams.qp.m_star.col(0).subrows(0, 1));
-    println!("x0: {:?}", solver.elements.beams.qp.x0);
-    println!("qp.fx (main): {:?}", solver.elements.beams.qp.fx);
+    // println!("x0: {:?}", solver.elements.beams.qp.x0);
+    // println!("qp.fx (main): {:?}", solver.elements.beams.qp.fx);
 
     // Get static solution
     let _res = solver.step(&mut static_state);
@@ -168,7 +170,7 @@ fn main() {
     println!("Baseline Modal Analysis:");
     let mut base_state = undamped_model.create_state();
 
-    let (eig_val, _eig_vec) = modal_analysis(&out_dir, &undamped_model, base_state);
+    let (eig_val, _eig_vec, mass_norm_amp_base) = modal_analysis(&out_dir, &undamped_model, base_state);
 
     let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
 
@@ -176,7 +178,7 @@ fn main() {
 
     println!("Prestressed Modal Analysis:");
 
-    let (eig_val, eig_vec) = modal_analysis(&out_dir, &undamped_model, static_state.clone());
+    let (eig_val, eig_vec, mass_norm_amp) = modal_analysis(&out_dir, &undamped_model, static_state.clone());
 
     let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
 
@@ -186,14 +188,19 @@ fn main() {
     // Only consider the undamped_model for this analysis
 
     // Apply only the eig_vec as a set of displacements
+    let mode_ind=0;
     internal_forces(
         &undamped_model,
         &(static_state.clone()),
         eig_vec.col(0).clone(),
         out_dir,
-        0,
+        mode_ind+1,
         tip_amp,
+        mass_norm_amp_base[mode_ind],
+        mass_norm_amp[mode_ind],
     );
+
+    // println!("Tip amplitude for unit modal: {:?}", 1./mass_norm_amp[0]);
 
     // ----- Transient Time Integration ----------------------------------
 
@@ -278,8 +285,13 @@ fn write_fc_star(
     mut file: File,
     stations : &Vec<f64>,
     weights : &Vec<f64>,
-    f_c: MatRef<f64>
+    f_c: MatRef<f64>,
+    mass_norm_amp: f64
     ){
+    write!(
+        file,
+        "Mass normalized modal amplitude : {} \n", mass_norm_amp
+    ).unwrap();
     write!(
         file,
         "station,weight,Fx,Fy,Fz,Mx,My,Mz (OpenTurbine Coordinates) \n",
@@ -302,7 +314,10 @@ fn internal_forces(
     eigen_shape: ColRef<f64>,
     out_dir: &str,
     mode: usize,
-    tip_amp : f64) {
+    tip_amp : f64,
+    shape_to_mass_norm: f64, // modal w/o prestress
+    shape_to_mass_norm_prestress: f64 // prestressed modal
+) {
     // Only consider the undamped_model for this analysis
 
 
@@ -339,7 +354,8 @@ fn internal_forces(
         File::create(format!("{out_dir}/fc_star_prestress_{:02}.csv", mode)).unwrap(),
         &section_loc,
         &section_weights,
-        fe_c_star.as_ref()
+        fe_c_star.as_ref(),
+        0.0
     );
 
 
@@ -379,7 +395,8 @@ fn internal_forces(
         File::create(format!("{out_dir}/fc_star_eigen_{:02}.csv", mode)).unwrap(),
         &section_loc,
         &section_weights,
-        fe_c_star.as_ref()
+        fe_c_star.as_ref(),
+        shape_to_mass_norm * tip_amp
     );
 
 
@@ -421,12 +438,13 @@ fn internal_forces(
         File::create(format!("{out_dir}/fc_star_pre_and_eigen_{:02}.csv", mode)).unwrap(),
         &section_loc,
         &section_weights,
-        fe_c_star.as_ref()
+        fe_c_star.as_ref(),
+        shape_to_mass_norm_prestress * tip_amp
     );
 
 }
 
-fn modal_analysis(out_dir: &str, model: &Model, mut state: State) -> (Col<f64>, Mat<f64>) {
+fn modal_analysis(out_dir: &str, model: &Model, mut state: State) -> (Col<f64>, Mat<f64>, Col<f64>) {
     // Create solver and state from model
     let mut solver = model.create_solver();
 
@@ -446,7 +464,7 @@ fn modal_analysis(out_dir: &str, model: &Model, mut state: State) -> (Col<f64>, 
     );
 
     let mass: Mat<f64> = solver.m.clone().to_owned();
-    let stiff = solver.kt.clone().to_owned();
+    // let stiff = solver.kt.clone().to_owned();
 
     println!("This needs to be updated for free-free");
     let ndof_bc = solver.n_system - 6;
@@ -483,6 +501,15 @@ fn modal_analysis(out_dir: &str, model: &Model, mut state: State) -> (Col<f64>, 
             .unwrap();
         zipped!(&mut c).for_each(|unzipped!(c)| *c /= max);
     });
+
+    // Calculate the mass normalized modal amplitude for each of the mode shapes
+    let mut mass_norm_amp = Col::<f64>::zeros(eig_vec.shape().1);
+
+    eig_vec.col_iter().enumerate().for_each(|(i, phi)|{
+        mass_norm_amp[i] = (phi.transpose() * &mass * phi).sqrt();
+    });
+
+    // println!("phi^T M phi: {:?}", eig_vec.clone().transpose() * &mass * eig_vec.clone());
 
     // Write eigenanalysis results to output file
     let mut file = File::create(format!("{out_dir}/compare_eigenanalysis.csv")).unwrap();
@@ -554,5 +581,5 @@ fn modal_analysis(out_dir: &str, model: &Model, mut state: State) -> (Col<f64>, 
         },
     );
 
-    (eig_val, eig_vec)
+    (eig_val, eig_vec, mass_norm_amp)
 }
