@@ -27,14 +27,14 @@ fn main() {
 
     // Settings
     let inp_dir = "examples/inputs";
-    let n_cycles = 3.5; // Number of oscillations to simulate
+    let n_cycles = 1.5; // Number of oscillations to simulate
     let rho_inf = 1.; // Numerical damping
     let max_iter = 20; // Max convergence iterations
     let time_step = 0.01; // Time step
     let nqp = Some(12); // Number of guass quad points to use. None-> trapezoid rule
 
     // see clear axial quadratic forces, so keep amplitudes small
-    let tip_amp = 0.00007850090768953785;
+    let tip_amp = 0.0001;
 
     // let out_dir = "output/bar_sub";
 
@@ -100,25 +100,95 @@ fn main() {
     undamped_model.add_prescribed_constraint(node_ids_undamped[0]);
     model.add_prescribed_constraint(node_ids[0]);
 
+    // ----- Static + Transient Time Integration ----------------------------------
+
+    let rot_rad_s_options = col![0.0, 6.1];
+
+    rot_rad_s_options
+        .iter()
+        .enumerate()
+        .for_each(|(rot_ind, &rot_rad_s)| {
+
+        let out_dir_curr = format!("{out_dir}/rot_{:03}_rad_s", rot_rad_s);
+
+        fs::create_dir_all(&out_dir_curr).unwrap();
+
+
+        let mut file = File::create(format!("{out_dir_curr}/rot_speed.csv")).unwrap();
+        write!(
+            file,
+            "Rot speed (rad/s) ,\n{} \n", rot_rad_s
+        ).unwrap();
+
+        let (undamped_pre_model,
+            pre_model,
+            static_state,
+            omega,
+            eig_vec,
+            mass_norm_amp,
+            mass_norm_amp_base
+        ) = prestress_analysis(
+            undamped_model.clone(),
+            model.clone(),
+            rot_rad_s,
+            nqp,
+            &out_dir_curr
+        );
+
+        // Loop through modes and run simulation
+        izip!(omega.iter(), eig_vec.col_iter())
+            .take(4)
+            .enumerate()
+            .for_each(|(i, (&omega, shape))| {
+
+                // Static / undamped modal strain energy analysis
+                internal_forces(
+                    &undamped_pre_model,
+                    &(static_state.clone()),
+                    shape.clone(),
+                    &out_dir_curr,
+                    i+1,
+                    tip_amp,
+                    mass_norm_amp_base[i],
+                    mass_norm_amp[i],
+                );
+
+                // Dynamic Analysis to use log dec.
+                let t_end = 2. * PI / omega;
+                let time_step = t_end / 100.;
+                let n_steps = (n_cycles * t_end / time_step) as usize;
+
+                let mut curr_model = pre_model.clone();
+                curr_model.set_time_step(time_step);
+
+                // run_simulation(i + 1, time_step, n_steps, shape, out_dir, model.clone());
+                run_simulation(i + 1, time_step, n_steps, shape, &out_dir_curr, curr_model);
+            });
+
+    });
+}
+
+
+fn prestress_analysis(
+    mut undamped_model : Model,
+    mut model : Model,
+    rot_rad_s : f64,
+    nqp : Option<usize>,
+    out_dir: &str
+) -> (Model, Model, State, Col<f64>, Mat<f64>, Col<f64>, Col<f64>) {
+
     // ----- Static Analysis ----------------------------------
 
     undamped_model.set_static_solve();
 
     // create a solver so can access data on solver, but will
     // eventually recreate with the distrubted load.
-    let mut solver = undamped_model.create_solver();
-
-    // // Distributed load
-    // solver.elements.beams.qp.fx
-    //     .subrows_mut(0, 1)
-    //     .col_iter_mut()
-    //     .for_each(|mut fx| fx[0] = 1.0e4); //1e8 is good when have sufficient integration.
+    let solver = undamped_model.create_solver();
 
     // Variable Distributed load
     let n_qps = solver.elements.beams.qp.fx.ncols();
     let mut fx = Mat::<f64>::zeros(6, n_qps);
 
-    let rot_rad_s = 6.0; // rad/s
     izip!(
         fx.subrows_mut(0, 1).col_iter_mut(), //xdof is row 0
         solver.elements.beams.qp.x0.subrows(0, 1).col_iter(),
@@ -126,29 +196,20 @@ fn main() {
     )
     .for_each(|(mut fx_col, radius, m_star_col)| {
         // Need to extract the quadrature point mass here.
-        fx_col[0] = m_star_col[0]*radius[0] * rot_rad_s * rot_rad_s;
+        fx_col[0] = m_star_col[0] * radius[0] * rot_rad_s * rot_rad_s;
     });
     match nqp {
         Some(_) => println!("Cannot use this as distributed loads if have non-constant cross section!"),
         None => (),
     }
-    // // Next two lines to actually set distribued loads
-    // undamped_model.set_distributed_loads(fx.clone());
-    // model.set_distributed_loads(fx.clone());
+
+    // Next two lines to actually set distribued loads
+    undamped_model.set_distributed_loads(fx.clone());
+    model.set_distributed_loads(fx.clone());
 
     // static state and solvers
     let mut static_state = undamped_model.create_state();
     let mut solver = undamped_model.create_solver();
-
-    // Point load:
-    // Get DOF index for beam tip node X direction and apply load
-    let tip_node_id = *node_ids.last().unwrap();
-    let tip_x_dof = solver.nfm.get_dof(tip_node_id, Direction::X).unwrap();
-    solver.fx[tip_x_dof] = 0.0e3; //1.0e6 gives a clear freq. shift.
-
-    // println!("Mass[0,0] {:?}", solver.elements.beams.qp.m_star.col(0).subrows(0, 1));
-    // println!("x0: {:?}", solver.elements.beams.qp.x0);
-    // println!("qp.fx (main): {:?}", solver.elements.beams.qp.fx);
 
     // Get static solution
     let _res = solver.step(&mut static_state);
@@ -157,69 +218,37 @@ fn main() {
     let n_nodes = undamped_model.nodes.len();
     let s_nodes = Col::<f64>::from_fn(n_nodes, |i| undamped_model.nodes[i].s);
 
-    println!("Static u_x: {:?}", static_state.u.row(0));
+    // println!("Static u_x: {:?}", static_state.u.row(0));
     // println!("Static x_x: {:?}", static_state.x.row(0)); // x = x_0 + u
-    println!("Node positions on [0, 1]: {:?}", s_nodes);
+    // println!("Node positions on [0, 1]: {:?}", s_nodes);
 
     // ----- Eigen Analysis ----------------------------------
 
-    model.set_dynamic_solve();
+    undamped_model.set_dynamic_solve();
 
     // Perform modal analysis
 
-    println!("Baseline Modal Analysis:");
-    let mut base_state = undamped_model.create_state();
+    // println!("Baseline Modal Analysis:");
+    let base_state = undamped_model.create_state();
 
-    let (eig_val, _eig_vec, mass_norm_amp_base) = modal_analysis(&out_dir, &undamped_model, base_state);
+    let (_eig_val, _eig_vec, mass_norm_amp_base) = modal_analysis(&out_dir, &undamped_model, base_state);
 
-    let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
+    // let omega = Col::<f64>::from_fn(_eig_val.nrows(), |i| _eig_val[i].sqrt());
 
-    println!("Frequency [Hz]: {:?}", Scale(1./2./PI) * &omega.subrows(0, 6));
+    // println!("Frequency [Hz]: {:?}", Scale(1./2./PI) * &omega.subrows(0, 6));
 
-    println!("Prestressed Modal Analysis:");
+    // println!("Prestressed Modal Analysis:");
 
     let (eig_val, eig_vec, mass_norm_amp) = modal_analysis(&out_dir, &undamped_model, static_state.clone());
 
     let omega = Col::<f64>::from_fn(eig_val.nrows(), |i| eig_val[i].sqrt());
 
-    println!("Frequency [Hz]: {:?}", Scale(1./2./PI) * &omega.subrows(0, 6));
+    // println!("Frequency [Hz]: {:?}", Scale(1./2./PI) * &omega.subrows(0, 6));
 
-    // ----- Static Analysis of Internal Modal Forces ---------------------
-    // Only consider the undamped_model for this analysis
+    (undamped_model, model, static_state, omega, eig_vec, mass_norm_amp, mass_norm_amp_base)
 
-    // Apply only the eig_vec as a set of displacements
-    let mode_ind=0;
-    internal_forces(
-        &undamped_model,
-        &(static_state.clone()),
-        eig_vec.col(0).clone(),
-        out_dir,
-        mode_ind+1,
-        tip_amp,
-        mass_norm_amp_base[mode_ind],
-        mass_norm_amp[mode_ind],
-    );
-
-    // println!("Tip amplitude for unit modal: {:?}", 1./mass_norm_amp[0]);
-
-    // ----- Transient Time Integration ----------------------------------
-
-    // Loop through modes and run simulation
-    izip!(omega.iter(), eig_vec.col_iter())
-        .take(4)
-        .enumerate()
-        .for_each(|(i, (&omega, shape))| {
-            let t_end = 2. * PI / omega;
-            let time_step = t_end / 100.;
-            let n_steps = (n_cycles * t_end / time_step) as usize;
-
-            let mut curr_model = model.clone();
-            curr_model.set_time_step(time_step);
-
-            // run_simulation(i + 1, time_step, n_steps, shape, out_dir, model.clone());
-            run_simulation(i + 1, time_step, n_steps, shape, out_dir, curr_model);
-        });
 }
+
 
 fn run_simulation(
     mode: usize,
@@ -343,7 +372,7 @@ fn internal_forces(
         solver_undamped.elements.beams.qp.rr0.as_ref()
     );
 
-    println!("fe_c_star (static) : {:?}", fe_c_star);
+    // println!("fe_c_star (static) : {:?}", fe_c_star);
 
     // let section_loc = model.beam_elements[0].sections.iter().map(|s| s.s).collect_vec();
     let section_loc = model.beam_elements[0].quadrature.points.iter().map(|&s| (s+1.)/2.).collect_vec();
@@ -370,7 +399,7 @@ fn internal_forces(
     eig_state.calc_displacement(h);
     eig_state.calculate_x();
 
-    println!("Eigen state.u {:?}", eig_state.u);
+    // println!("Eigen state.u {:?}", eig_state.u);
 
     solver_undamped.elements.assemble_system(
         &eig_state,
@@ -400,6 +429,49 @@ fn internal_forces(
     );
 
 
+
+    // Apply only the eig_vec as a set of displacements - larger amplitude
+    let mut eig_state = model.create_state();
+    let h = 1.;
+    let u = eigen_shape * Scale(tip_amp*1.0e3);
+
+    eig_state.u_prev.fill_zero();
+    eig_state.u_prev.row_mut(3).fill(1.);
+    eig_state.u_delta.copy_from(&u.as_ref().as_mat_ref(6, eig_state.n_nodes));
+    eig_state.calc_displacement(h);
+    eig_state.calculate_x();
+
+    // println!("Eigen state.u {:?}", eig_state.u);
+
+    solver_undamped.elements.assemble_system(
+        &eig_state,
+        &solver_undamped.nfm,
+        solver_undamped.p.h,
+        solver_undamped.m.as_mut(),
+        solver_undamped.ct.as_mut(),
+        solver_undamped.kt.as_mut(),
+        solver_undamped.r.as_mut(),
+    );
+
+    let mut fe_c_star = Mat::<f64>::zeros(6, nqp);
+
+    rotate_col_to_sectional(
+        fe_c_star.as_mut(),
+        solver_undamped.elements.beams.qp.fe_c.as_ref(),
+        solver_undamped.elements.beams.qp.rr0.as_ref()
+    );
+
+
+    write_fc_star(
+        File::create(format!("{out_dir}/fc_star_eigen_large_{:02}.csv", mode)).unwrap(),
+        &section_loc,
+        &section_weights,
+        fe_c_star.as_ref(),
+        shape_to_mass_norm * tip_amp
+    );
+
+
+
     // Apply both combined - need to verify how to do this.
 
 
@@ -413,7 +485,7 @@ fn internal_forces(
     eig_pre_state.calc_displacement(h);
     eig_pre_state.calculate_x();
 
-    println!("Pre + Eigen state.u {:?}", eig_state.u);
+    // println!("Pre + Eigen state.u {:?}", eig_state.u);
 
     solver_undamped.elements.assemble_system(
         &eig_pre_state,
