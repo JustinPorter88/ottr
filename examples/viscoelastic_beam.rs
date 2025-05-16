@@ -27,28 +27,42 @@ fn main() {
 
     // Settings
     let inp_dir = "examples/inputs";
-    let n_cycles = 1.5; // Number of oscillations to simulate
+    let n_cycles = 8.0; // Number of oscillations to simulate
     let rho_inf = 1.; // Numerical damping
     let max_iter = 20; // Max convergence iterations
-    let time_step = 0.01; // Time step
-    let nqp = Some(12); // Number of guass quad points to use. None-> trapezoid rule
+    let time_step = 0.0001; // Time step
+    let steps_per_cycle  = 100.;
+    let nqp = None; // Number of guass quad points to use. None-> trapezoid rule
 
     // see clear axial quadratic forces, so keep amplitudes small
     let tip_amp = 0.0001;
 
     // let out_dir = "output/bar_sub";
 
-    // Box Beam Example from SONATA Repo
-    let out_dir = "output/box_beam";
-    let bd_file = "Box_Beam_BeamDyn.dat";
-    let blade_file = "Box_Beam_BeamDyn_Blade.dat";
-    // let blade_file = "Box_Beam_BeamDyn_Blade_Clean.dat";
-    let viscoelastic_file = "Box_Beam_BeamDyn_Blade_Viscoelastic.dat";
+    // // Box Beam Example from SONATA Repo
+    // let out_dir = "output/box_beam";
+    // let bd_file = "Box_Beam_BeamDyn.dat";
+    // let blade_file = "Box_Beam_BeamDyn_Blade.dat";
+    // // let blade_file = "Box_Beam_BeamDyn_Blade_Clean.dat";
+    // let viscoelastic_file = "Box_Beam_BeamDyn_Blade_Viscoelastic.dat";
 
     // // 13 Thermoplastic Blade
     // let out_dir = "output/tp13m";
     // let blade_file = "Mass_BD_Blade.dat";
     // let bd_file = "IACMI_13m_thermoplastic_BeamDyn.dat";
+
+    // // // Bar Subcomponent
+    // let out_dir = "output/bar-subcomponent";
+    // let bd_file = "bar-subcomponent_BeamDyn.dat";
+    // let blade_file = "bar-subcomponent_BeamDyn_Blade.dat";
+    // let viscoelastic_file = "Box_Beam_BeamDyn_Blade_Viscoelastic.dat";
+
+    // // IEA 22 MW Example
+    let out_dir = "output/iea_22mw_opt2";
+    let bd_file = "IEA_22MW_opt2/IEA_22MW_BeamDyn.dat";
+    let blade_file = "IEA_22MW_opt2/IEA_22MW_BeamDyn_Blade.dat";
+    let viscoelastic_file = "IEA_22MW_opt2/IEA_22MW_BeamDyn_Blade_Viscoelastic.dat";
+
 
     // ----- Model Setup ----------------------------------
 
@@ -102,7 +116,7 @@ fn main() {
 
     // ----- Static + Transient Time Integration ----------------------------------
 
-    let rot_rad_s_options = col![0.0, 6.1];
+    let rot_rad_s_options = col![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
 
     rot_rad_s_options
         .iter()
@@ -137,7 +151,7 @@ fn main() {
 
         // Loop through modes and run simulation
         izip!(omega.iter(), eig_vec.col_iter())
-            .take(4)
+            .take(2)
             .enumerate()
             .for_each(|(i, (&omega, shape))| {
 
@@ -155,11 +169,14 @@ fn main() {
 
                 // Dynamic Analysis to use log dec.
                 let t_end = 2. * PI / omega;
-                let time_step = t_end / 100.;
+                let time_step = t_end / steps_per_cycle;
                 let n_steps = (n_cycles * t_end / time_step) as usize;
 
                 let mut curr_model = pre_model.clone();
                 curr_model.set_time_step(time_step);
+
+                // println!("rot_speed={:?}, omega = {:?}, time_step = {:?}", rot_rad_s, omega, time_step);
+                // println!("rot_speed={:?}, time_step = {:?}, number_steps = {:?}", rot_rad_s, time_step, n_steps);
 
                 // run_simulation(i + 1, time_step, n_steps, shape, out_dir, model.clone());
                 run_simulation(i + 1, time_step, n_steps, shape, &out_dir_curr, curr_model);
@@ -277,6 +294,7 @@ fn run_simulation(
 
     // Create output file
     let mut file = File::create(format!("{out_dir}/displacement_{:02}.csv", mode)).unwrap();
+    let mut file_vel = File::create(format!("{out_dir}/velocity_{:02}.csv", mode)).unwrap();
 
     // Cartesian rotation vector
     let mut rv = Col::<f64>::zeros(3);
@@ -286,6 +304,7 @@ fn run_simulation(
         // Calculate time
         let t = (i as f64) * time_step;
 
+        // Write displacements to file
         write!(file, "{t}").unwrap();
         state.u.col_iter().for_each(|c| {
             quat_as_rotation_vector(c.subrows(3, 4), rv.as_mut());
@@ -297,6 +316,19 @@ fn run_simulation(
             .unwrap();
         });
         file.write(b"\n").unwrap();
+
+
+        // Write velcities to a file
+        write!(file_vel, "{t}").unwrap();
+        state.v.col_iter().for_each(|c| {
+            write!(
+                file_vel,
+                ",{},{},{},{},{},{}",
+                c[0], c[1], c[2], c[3], c[4], c[5]
+            )
+            .unwrap();
+        });
+        file_vel.write(b"\n").unwrap();
 
         // Take step and get convergence result
         let res = solver.step(&mut state);
@@ -538,7 +570,6 @@ fn modal_analysis(out_dir: &str, model: &Model, mut state: State) -> (Col<f64>, 
     let mass: Mat<f64> = solver.m.clone().to_owned();
     // let stiff = solver.kt.clone().to_owned();
 
-    println!("This needs to be updated for free-free");
     let ndof_bc = solver.n_system - 6;
     let lu = solver.m.submatrix(6, 6, ndof_bc, ndof_bc).partial_piv_lu();
     let a = lu.solve(solver.kt.submatrix(6, 6, ndof_bc, ndof_bc));
