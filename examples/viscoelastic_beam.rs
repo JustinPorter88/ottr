@@ -37,6 +37,12 @@ fn main() {
     // see clear axial quadratic forces, so keep amplitudes small
     let tip_amp = 0.0001;
 
+    // Original mu values:
+    // let mu_damping = Damping::Mu(col![3.336e-4, 3.535e-4, 3.137e-4, 3.336e-4, 3.137e-4, 3.535e-4]);
+    //Updated mu values
+    let mu_damping = Damping::Mu(col![3.311e-4, 3.467e-4, 3.155e-4, 3.311e-4, 3.155e-4, 3.467e-4]);
+
+
     // let out_dir = "output/bar_sub";
 
     // // Box Beam Example from SONATA Repo
@@ -58,11 +64,16 @@ fn main() {
     // let viscoelastic_file = "Box_Beam_BeamDyn_Blade_Viscoelastic.dat";
 
     // // IEA 22 MW Example
-    let out_dir = "output/iea_22mw_opt2";
-    let bd_file = "IEA_22MW_opt2/IEA_22MW_BeamDyn.dat";
-    let blade_file = "IEA_22MW_opt2/IEA_22MW_BeamDyn_Blade.dat";
-    let viscoelastic_file = "IEA_22MW_opt2/IEA_22MW_BeamDyn_Blade_Viscoelastic.dat";
+    // let out_dir = "output/iea_22mw_run3";
+    // let bd_file = "IEA_22MW_run2/IEA_22MW_BeamDyn.dat";
+    // let blade_file = "IEA_22MW_run2/IEA_22MW_BeamDyn_Blade.dat";
+    // let viscoelastic_file = "IEA_22MW_run2/IEA_22MW_BeamDyn_Blade_Viscoelastic.dat";
 
+    // Unrotated IEA 22MW simulation
+    let out_dir = "output/iea_22mw_unrotated_mu";
+    let bd_file = "IEA_22MW_unrotated/IEA_22MW_BeamDyn.dat";
+    let blade_file = "IEA_22MW_unrotated/IEA_22MW_BeamDyn_Blade.dat";
+    let viscoelastic_file = "IEA_22MW_unrotated/IEA_22MW_BeamDyn_Blade_Viscoelastic.dat";
 
     // ----- Model Setup ----------------------------------
 
@@ -90,6 +101,25 @@ fn main() {
         nqp,
     );
 
+
+    // Stiffness proportional modal
+    let mut mu_model = Model::new();
+    mu_model.set_rho_inf(rho_inf);
+    mu_model.set_max_iter(max_iter);
+    mu_model.set_time_step(time_step);
+
+    // Add BeamDyn blade to model
+    let (node_ids_undamped, _beam_elem_id) = add_beamdyn_blade(
+        &mut mu_model,
+        &format!("{inp_dir}/{bd_file}"),
+        &format!("{inp_dir}/{blade_file}"),
+        10,
+        mu_damping,
+        None,
+        nqp,
+    );
+
+
     // Damped Model Creation
     let mut model = Model::new();
     model.set_rho_inf(rho_inf);
@@ -113,10 +143,12 @@ fn main() {
     // Prescribed constraint to first node of beam
     undamped_model.add_prescribed_constraint(node_ids_undamped[0]);
     model.add_prescribed_constraint(node_ids[0]);
+    mu_model.add_prescribed_constraint(node_ids[0]);
 
     // ----- Static + Transient Time Integration ----------------------------------
 
     let rot_rad_s_options = col![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+    // let rot_rad_s_options = col![0.0, 0.8];
 
     rot_rad_s_options
         .iter()
@@ -124,8 +156,10 @@ fn main() {
         .for_each(|(rot_ind, &rot_rad_s)| {
 
         let out_dir_curr = format!("{out_dir}/rot_{:03}_rad_s", rot_rad_s);
+        let out_dir_mu_curr = format!("{out_dir}/rot_{:03}_rad_s/mu", rot_rad_s);
 
         fs::create_dir_all(&out_dir_curr).unwrap();
+        fs::create_dir_all(&out_dir_mu_curr).unwrap();
 
 
         let mut file = File::create(format!("{out_dir_curr}/rot_speed.csv")).unwrap();
@@ -136,6 +170,7 @@ fn main() {
 
         let (undamped_pre_model,
             pre_model,
+            mu_pre_model,
             static_state,
             omega,
             eig_vec,
@@ -144,6 +179,7 @@ fn main() {
         ) = prestress_analysis(
             undamped_model.clone(),
             model.clone(),
+            mu_model.clone(),
             rot_rad_s,
             nqp,
             &out_dir_curr
@@ -180,6 +216,17 @@ fn main() {
 
                 // run_simulation(i + 1, time_step, n_steps, shape, out_dir, model.clone());
                 run_simulation(i + 1, time_step, n_steps, shape, &out_dir_curr, curr_model);
+
+                // Mu Damping transient simulation
+                let mut curr_model = mu_pre_model.clone();
+                curr_model.set_time_step(time_step);
+
+                // println!("rot_speed={:?}, omega = {:?}, time_step = {:?}", rot_rad_s, omega, time_step);
+                // println!("rot_speed={:?}, time_step = {:?}, number_steps = {:?}", rot_rad_s, time_step, n_steps);
+
+                // run_simulation(i + 1, time_step, n_steps, shape, out_dir, model.clone());
+                run_simulation(i + 1, time_step, n_steps, shape, &out_dir_mu_curr, curr_model);
+
             });
 
     });
@@ -189,10 +236,11 @@ fn main() {
 fn prestress_analysis(
     mut undamped_model : Model,
     mut model : Model,
+    mut mu_model : Model,
     rot_rad_s : f64,
     nqp : Option<usize>,
     out_dir: &str
-) -> (Model, Model, State, Col<f64>, Mat<f64>, Col<f64>, Col<f64>) {
+) -> (Model, Model, Model, State, Col<f64>, Mat<f64>, Col<f64>, Col<f64>) {
 
     // ----- Static Analysis ----------------------------------
 
@@ -223,6 +271,7 @@ fn prestress_analysis(
     // Next two lines to actually set distribued loads
     undamped_model.set_distributed_loads(fx.clone());
     model.set_distributed_loads(fx.clone());
+    mu_model.set_distributed_loads(fx.clone());
 
     // static state and solvers
     let mut static_state = undamped_model.create_state();
@@ -262,7 +311,7 @@ fn prestress_analysis(
 
     // println!("Frequency [Hz]: {:?}", Scale(1./2./PI) * &omega.subrows(0, 6));
 
-    (undamped_model, model, static_state, omega, eig_vec, mass_norm_amp, mass_norm_amp_base)
+    (undamped_model, model, mu_model, static_state, omega, eig_vec, mass_norm_amp, mass_norm_amp_base)
 
 }
 
